@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebLLM Alexa-like App (0.5B)</title>
+    <title>WebLLM Alexa-like App (0.5B Optimized)</title>
     <style>
         body {
             font-family: 'Helvetica Neue', Arial, sans-serif;
@@ -15,6 +15,7 @@
             justify-content: center;
             height: 100vh;
             margin: 0;
+            overflow: hidden;
         }
         #container {
             text-align: center;
@@ -47,15 +48,18 @@
             background-color: #00a0e9;
             color: white;
             border: none;
-            padding: 12px 24px;
+            padding: 14px 28px;
             font-size: 16px;
             border-radius: 25px;
             cursor: pointer;
             font-weight: bold;
+            box-shadow: 0 4px 15px rgba(0, 160, 233, 0.4);
+            transition: transform 0.1s ease;
         }
-        button:disabled { background-color: #444; cursor: not-allowed; }
-        #log { margin-top: 20px; font-size: 14px; color: #aaa; min-height: 40px; }
-        #subtitle { font-size: 18px; margin-top: 10px; font-weight: bold; color: #fff; }
+        button:active { transform: scale(0.96); }
+        button:disabled { background-color: #444; box-shadow: none; cursor: not-allowed; }
+        #log { margin-top: 20px; font-size: 13px; color: #888; min-height: 40px; line-height: 1.4; }
+        #subtitle { font-size: 18px; margin-top: 10px; font-weight: bold; color: #fff; min-height: 27px; }
     </style>
 </head>
 <body>
@@ -65,10 +69,10 @@
     <div id="ring" class="alexa-ring status-loading"></div>
     <p id="subtitle">モデル初期化中...</p>
     <button id="startBtn" disabled>会話をスタート</button>
-    <div id="log">モデルのダウンロード（初回のみ数百MB）を待っています...</div>
+    <div id="log">モデルのロード（初回のみ数百MB）を待っています...</div>
 </div>
 
-<!-- WebLLMをCDNから読み込み -->
+<!-- WebLLMをCDNからインポート -->
 <script type="module">
     import * as webllm from "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm/+esm";
 
@@ -77,15 +81,18 @@
     const startBtn = document.getElementById("startBtn");
     const log = document.getElementById("log");
 
-    // アレクサ風のキャラクター付け
-    const SYSTEM_PROMPT = "あなたは親切な音声アシスタントのアレクサです。ユーザーの問いかけに対し、2文以内で簡潔に、フレンドリーな日本語で答えてください。";
-    const MODEL_NAME = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC"; // めっちゃ軽量な0.5Bモデル
+    // 音声アシスタントとして簡潔に日本語で答えさせる指示
+    const SYSTEM_PROMPT = "あなたはアレクサです。ユーザーの問いかけに対し、2文以内で簡潔に、フレンドリーな日本語で答えてください。";
+    const MODEL_NAME = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC"; 
+
+    // 🔥 コンテキストサイズの設定（2048 または 4096 を指定）
+    const CONTEXT_SIZE = 2048; 
 
     let engine;
     let recognition;
     let isTalking = false;
 
-    // 1. WebLLMの初期化
+    // 1. WebLLMの初期化と拡張チューニング
     async function initLLM() {
         try {
             if (!navigator.gpu) {
@@ -94,11 +101,19 @@
 
             engine = await webllm.CreateMLCEngine(MODEL_NAME, {
                 initProgressCallback: (report) => {
-                    log.innerText = report.text; // ダウンロード進捗を表示
+                    log.innerText = report.text; // 進捗状況を画面に表示
+                },
+                // 内部処理の最適化オプション
+                logLevel: "error", // デバッグ出力を抑制してオーバーヘッドを排除
+                appConfig: {
+                    kvCacheConfig: {
+                        slidingWindowSize: CONTEXT_SIZE,  // 2048または4096に設定
+                        attentionSinkSize: 4             // 長文会話でもシステムプロンプトの記憶を常時キープ
+                    }
                 }
             });
 
-            // 準備完了
+            // 準備完了状態のUIへ変更
             ring.className = "alexa-ring status-ready";
             subtitle.innerText = "準備完了";
             log.innerText = "ボタンを押して話しかけてください。";
@@ -111,46 +126,47 @@
         }
     }
 
-    // 2. 音声認識（耳）と音声合成（口）の準備
+    // 2. 音声認識（耳）のセットアップ
     function initSpeech() {
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (!SpeechRecognition) {
-            log.innerText = "このブラウザは音声認識に対応していません。(Chromeを推奨)";
+            log.innerText = "このブラウザはSpeechRecognitionに対応していません。(Chrome推奨)";
             return;
         }
 
         recognition = new SpeechRecognition();
         recognition.lang = "ja-JP";
-        recognition.continuous = false;
-        recognition.interimResults = false;
+        recognition.continuous = false;   // 一言ごとに処理を区切る
+        recognition.interimResults = false; // 確定した結果のみ取得
 
-        // 音声認識がテキスト化に成功したとき
+        // 聞き取りに成功したときの処理
         recognition.onresult = async (event) => {
-            const userText = event.results[0][0].transcript;
+            const userText = event.results[transcript];
             subtitle.innerText = `「${userText}」`;
-            
-            // 脳（LLM）へ送る
-            await askAI(userText);
+            await askAI(userText); // 脳（LLM）へ送信
         };
 
-        // 音声認識が終了したとき（何も話さなかった場合など）
+        // 喋り終わるなどして音声認識が途切れたときの自動復帰ループ
         recognition.onend = () => {
             if (!isTalking && ring.className === "alexa-ring status-listening") {
-                // 返答フェーズに入っていなければ聞き取りを再開
                 startListening();
             }
         };
     }
 
-    // 3. 聞き取り開始
+    // 3. 聞き取り状態の開始
     function startListening() {
         if (isTalking) return;
         ring.className = "alexa-ring status-listening";
         log.innerText = "話しかけてください...";
-        recognition.start();
+        try {
+            recognition.start();
+        } catch (e) {
+            // 既に起動している場合の二重起動エラーを回避
+        }
     }
 
-    // 4. 脳（LLM）で返答を作成
+    // 4. 脳（LLM）での返答作成
     async function askAI(inputText) {
         ring.className = "alexa-ring status-thinking";
         log.innerText = "考えています...";
@@ -164,12 +180,12 @@
         try {
             const reply = await engine.chat.completions.create({ 
                 messages,
-                temperature: 0.7,
-                max_tokens: 128 // 音声アシスタントなので短く切る
+                temperature: 0.6, // 応答の正確性と自然さのバランス
+                max_tokens: 128   // 音声での聞きやすさを考慮した出力制限
             });
             
-            const replyText = reply.choices[0].message.content;
-            speak(replyText);
+            const replyText = reply.choices.message.content;
+            speak(replyText); // 口（音声合成）へ送信
         } catch (err) {
             log.innerText = "LLMエラー: " + err.message;
             isTalking = false;
@@ -177,7 +193,7 @@
         }
     }
 
-    // 5. 口（音声合成）で喋る
+    // 5. 口（音声合成）での読み上げ
     function speak(text) {
         ring.className = "alexa-ring status-speaking";
         log.innerText = "応答中...";
@@ -186,7 +202,7 @@
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = "ja-JP";
 
-        // 喋り終わったら自動的に次の聞き取りを開始（ハンズフリー・ループ）
+        // 読み上げが完了したら、ハンズフリーで次の会話（聞き取り）を再開
         utterance.onend = () => {
             isTalking = false;
             startListening();
@@ -195,13 +211,13 @@
         window.speechSynthesis.speak(utterance);
     }
 
-    // イベントリスナー
+    // 会話スタートボタン
     startBtn.addEventListener("click", () => {
-        startBtn.style.display = "none"; // スタート後はボタンを隠す
+        startBtn.style.display = "none";
         startListening();
     });
 
-    // ページ読み込み時にLLMの初期化を開始
+    // ページロード時に即座に初期化を開始
     window.addEventListener("DOMContentLoaded", initLLM);
 </script>
 
