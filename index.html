@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebLLM Alexa-like App (0.5B)</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background-color: #111;
+            color: #fff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        #container {
+            text-align: center;
+            max-width: 400px;
+            padding: 20px;
+        }
+        /* アレクサ風の光るリング */
+        .alexa-ring {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            border: 4px solid #333;
+            margin: 30px auto;
+            transition: all 0.3s ease;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.5);
+        }
+        .status-loading { border-color: #ff9900; animation: pulse 1.5s infinite; }
+        .status-ready { border-color: #00a0e9; box-shadow: 0 0 20px #00a0e9; }
+        .status-listening { border-color: #00d2ff; box-shadow: 0 0 30px #00d2ff; animation: pulse 1s infinite; }
+        .status-thinking { border-color: #9b51e0; box-shadow: 0 0 25px #9b51e0; }
+        .status-speaking { border-color: #27ae60; box-shadow: 0 0 25px #27ae60; }
+
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+
+        button {
+            background-color: #00a0e9;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:disabled { background-color: #444; cursor: not-allowed; }
+        #log { margin-top: 20px; font-size: 14px; color: #aaa; min-height: 40px; }
+        #subtitle { font-size: 18px; margin-top: 10px; font-weight: bold; color: #fff; }
+    </style>
+</head>
+<body>
+
+<div id="container">
+    <h2>WebLLM Alexa (0.5B)</h2>
+    <div id="ring" class="alexa-ring status-loading"></div>
+    <p id="subtitle">モデル初期化中...</p>
+    <button id="startBtn" disabled>会話をスタート</button>
+    <div id="log">モデルのダウンロード（初回のみ数百MB）を待っています...</div>
+</div>
+
+<!-- WebLLMをCDNから読み込み -->
+<script type="module">
+    import * as webllm from "https://esm.run";
+
+    const ring = document.getElementById("ring");
+    const subtitle = document.getElementById("subtitle");
+    const startBtn = document.getElementById("startBtn");
+    const log = document.getElementById("log");
+
+    // アレクサ風のキャラクター付け
+    const SYSTEM_PROMPT = "あなたは親切な音声アシスタントのアレクサです。ユーザーの問いかけに対し、2文以内で簡潔に、フレンドリーな日本語で答えてください。";
+    const MODEL_NAME = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC"; // めっちゃ軽量な0.5Bモデル
+
+    let engine;
+    let recognition;
+    let isTalking = false;
+
+    // 1. WebLLMの初期化
+    async function initLLM() {
+        try {
+            if (!navigator.gpu) {
+                throw new Error("WebGPUがこのブラウザでサポートされていないか、有効になっていません。");
+            }
+
+            engine = await webllm.CreateMLCEngine(MODEL_NAME, {
+                initProgressCallback: (report) => {
+                    log.innerText = report.text; // ダウンロード進捗を表示
+                }
+            });
+
+            // 準備完了
+            ring.className = "alexa-ring status-ready";
+            subtitle.innerText = "準備完了";
+            log.innerText = "ボタンを押して話しかけてください。";
+            startBtn.disabled = false;
+
+            initSpeech();
+        } catch (err) {
+            log.innerText = "エラー: " + err.message;
+            subtitle.innerText = "起動失敗";
+        }
+    }
+
+    // 2. 音声認識（耳）と音声合成（口）の準備
+    function initSpeech() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            log.innerText = "このブラウザは音声認識に対応していません。(Chromeを推奨)";
+            return;
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.lang = "ja-JP";
+        recognition.continuous = false;
+        recognition.interimResults = false;
+
+        // 音声認識がテキスト化に成功したとき
+        recognition.onresult = async (event) => {
+            const userText = event.results[0][0].transcript;
+            subtitle.innerText = `「${userText}」`;
+            
+            // 脳（LLM）へ送る
+            await askAI(userText);
+        };
+
+        // 音声認識が終了したとき（何も話さなかった場合など）
+        recognition.onend = () => {
+            if (!isTalking && ring.className === "alexa-ring status-listening") {
+                // 返答フェーズに入っていなければ聞き取りを再開
+                startListening();
+            }
+        };
+    }
+
+    // 3. 聞き取り開始
+    function startListening() {
+        if (isTalking) return;
+        ring.className = "alexa-ring status-listening";
+        log.innerText = "話しかけてください...";
+        recognition.start();
+    }
+
+    // 4. 脳（LLM）で返答を作成
+    async function askAI(inputText) {
+        ring.className = "alexa-ring status-thinking";
+        log.innerText = "考えています...";
+        isTalking = true;
+
+        const messages = [
+            { role: "system", content: SYSTEM_PROMPT },
+            { role: "user", content: inputText }
+        ];
+
+        try {
+            const reply = await engine.chat.completions.create({ 
+                messages,
+                temperature: 0.7,
+                max_tokens: 128 // 音声アシスタントなので短く切る
+            });
+            
+            const replyText = reply.choices[0].message.content;
+            speak(replyText);
+        } catch (err) {
+            log.innerText = "LLMエラー: " + err.message;
+            isTalking = false;
+            ring.className = "alexa-ring status-ready";
+        }
+    }
+
+    // 5. 口（音声合成）で喋る
+    function speak(text) {
+        ring.className = "alexa-ring status-speaking";
+        log.innerText = "応答中...";
+        subtitle.innerText = text;
+
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "ja-JP";
+
+        // 喋り終わったら自動的に次の聞き取りを開始（ハンズフリー・ループ）
+        utterance.onend = () => {
+            isTalking = false;
+            startListening();
+        };
+
+        window.speechSynthesis.speak(utterance);
+    }
+
+    // イベントリスナー
+    startBtn.addEventListener("click", () => {
+        startBtn.style.display = "none"; // スタート後はボタンを隠す
+        startListening();
+    });
+
+    // ページ読み込み時にLLMの初期化を開始
+    window.addEventListener("DOMContentLoaded", initLLM);
+</script>
+
+</body>
+</html>
